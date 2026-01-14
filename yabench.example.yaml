@@ -1,0 +1,44 @@
+# yabench config example
+# Copy to yabench.yaml and customize
+
+# Global defaults (inherited by all tasks)
+defaults:
+  num_requests: 10
+  concurrency: 1
+  max_tokens: 256
+  input_tokens: 100
+  timeout: 120
+  no_verify_ssl: true
+
+# Benchmark tasks
+tasks:
+  local:
+    base_url: http://localhost:8000/v1
+    model: gpt-4
+
+  prod:
+    base_url: https://api.example.com/v1
+    model: llama-3
+    token: ${YABENCH_TOKEN}
+    num_requests: 100
+    concurrency: 10
+
+  openai:
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini
+    api_key: ${OPENAI_API_KEY}
+    no_verify_ssl: false
+
+  # Example with ShareGPT dataset (real-world prompts)
+  realistic:
+    base_url: http://localhost:8000/v1
+    model: llama-3
+    dataset: sharegpt  # Built-in: sharegpt, sharegpt-small
+    num_requests: 100
+    concurrency: 10
+
+  # Custom dataset from local file
+  custom:
+    base_url: http://localhost:8000/v1
+    dataset: /path/to/prompts.jsonl  # or .json, .txt
+    shuffle: true
