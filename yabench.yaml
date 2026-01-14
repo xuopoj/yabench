@@ -25,29 +25,3 @@ tasks:
     base_url: https://172.25.61.164:31004/v1/cbfda6be7955455e9c49b45ee556f427/deployments/ae146460-d669-42db-ab4a-f244e464b841
     dataset: sample-zh
     concurrency: 1
-  prod:
-    base_url: https://api.example.com/v1
-    model: llama-3
-    token: ${YABENCH_TOKEN}
-    num_requests: 100
-    concurrency: 10
-
-  openai:
-    base_url: https://api.openai.com/v1
-    model: gpt-4o-mini
-    api_key: ${OPENAI_API_KEY}
-    no_verify_ssl: false
-
-  # Example with ShareGPT dataset (real-world prompts)
-  realistic:
-    base_url: http://localhost:8000/v1
-    model: llama-3
-    dataset: sharegpt  # Built-in: sharegpt, sharegpt-small
-    num_requests: 100
-    concurrency: 10
-
-  # Custom dataset from local file
-  custom:
-    base_url: http://localhost:8000/v1
-    dataset: /path/to/prompts.jsonl  # or .json, .txt
-    shuffle: true
