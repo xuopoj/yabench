@@ -32,6 +32,7 @@ class BenchmarkResult:
     # Throughput
     tokens_per_second: float = 0.0  # Total output tokens / total duration
     requests_per_second: float = 0.0
+    prefill_tps_mean: float = 0.0  # Mean prefill tokens per second (input_tokens / TTFT)
 
     # Token counts
     total_input_tokens: int = 0
@@ -50,8 +51,9 @@ class BenchmarkResult:
             f"Duration: {self.total_duration:.2f}s",
             f"",
             f"Throughput:",
-            f"  Requests/sec: {self.requests_per_second:.2f}",
-            f"  Tokens/sec:   {self.tokens_per_second:.2f}",
+            f"  Requests/sec:  {self.requests_per_second:.2f}",
+            f"  Output TPS:    {self.tokens_per_second:.2f}",
+            f"  Prefill TPS:   {self.prefill_tps_mean:.2f}",
             f"",
             f"Latency (seconds):",
             f"  TTFT:     mean={self.ttft_mean:.3f} p50={self.ttft_p50:.3f} p95={self.ttft_p95:.3f} p99={self.ttft_p99:.3f}",
@@ -59,8 +61,8 @@ class BenchmarkResult:
             f"  ITL:      mean={self.inter_token_latency_mean:.4f}",
             f"",
             f"Tokens:",
-            f"  Input:  {self.total_input_tokens}",
-            f"  Output: {self.total_output_tokens}",
+            f"  Input:  {self.total_input_tokens} (mean: {self.total_input_tokens / max(self.num_completed, 1):.1f})",
+            f"  Output: {self.total_output_tokens} (mean: {self.total_output_tokens / max(self.num_completed, 1):.1f})",
         ]
         if self.errors:
             lines.append(f"\nErrors ({len(self.errors)}):")
@@ -120,6 +122,11 @@ def _compute_stats(result: BenchmarkResult) -> None:
     if result.total_duration > 0:
         result.tokens_per_second = result.total_output_tokens / result.total_duration
         result.requests_per_second = result.num_completed / result.total_duration
+
+    # Prefill TPS (mean of individual request prefill_tps)
+    prefill_tps_values = [m.prefill_tps for m in completed if m.prefill_tps > 0]
+    if prefill_tps_values:
+        result.prefill_tps_mean = statistics.mean(prefill_tps_values)
 
 
 async def run_benchmark(

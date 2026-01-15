@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import csv
 import json
 import os
 import sys
@@ -141,7 +142,8 @@ def result_to_dict(result: BenchmarkResult) -> dict:
         "total_duration": result.total_duration,
         "throughput": {
             "requests_per_second": result.requests_per_second,
-            "tokens_per_second": result.tokens_per_second,
+            "output_tps": result.tokens_per_second,
+            "prefill_tps": result.prefill_tps_mean,
         },
         "latency": {
             "ttft": {
@@ -164,6 +166,45 @@ def result_to_dict(result: BenchmarkResult) -> dict:
         },
         "errors": result.errors,
     }
+
+
+def result_to_csv_row(result: BenchmarkResult, task: TaskConfig) -> dict:
+    """Convert BenchmarkResult to flat dict for CSV."""
+    return {
+        "task": task.name,
+        "dataset": task.dataset or "",
+        "concurrency": task.concurrency,
+        "num_requests": result.num_requests,
+        "num_completed": result.num_completed,
+        "num_errors": result.num_errors,
+        "total_duration": result.total_duration,
+        "requests_per_second": result.requests_per_second,
+        "output_tps": result.tokens_per_second,
+        "prefill_tps": result.prefill_tps_mean,
+        "ttft_mean": result.ttft_mean,
+        "ttft_p50": result.ttft_p50,
+        "ttft_p95": result.ttft_p95,
+        "ttft_p99": result.ttft_p99,
+        "e2e_mean": result.e2e_latency_mean,
+        "e2e_p50": result.e2e_latency_p50,
+        "e2e_p95": result.e2e_latency_p95,
+        "e2e_p99": result.e2e_latency_p99,
+        "inter_token_latency_mean": result.inter_token_latency_mean,
+        "total_input_tokens": result.total_input_tokens,
+        "total_output_tokens": result.total_output_tokens,
+    }
+
+
+def write_csv(path: Path, result: BenchmarkResult, task: TaskConfig) -> None:
+    """Write result to CSV file, appending if file exists."""
+    row = result_to_csv_row(result, task)
+    file_exists = path.exists()
+
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def get_task_config(args: argparse.Namespace) -> TaskConfig | None:
@@ -293,7 +334,10 @@ async def run_task(task: TaskConfig, output: str | None, quiet: bool) -> int:
 
     if output:
         output_path = Path(output)
-        output_path.write_text(json.dumps(result_to_dict(result), indent=2))
+        if output_path.suffix.lower() == ".csv":
+            write_csv(output_path, result, task)
+        else:
+            output_path.write_text(json.dumps(result_to_dict(result), indent=2))
         if not quiet:
             print(f"\nResults saved to {output}")
 

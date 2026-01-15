@@ -3,8 +3,125 @@
 import time
 import json
 import httpx
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
+
+
+@dataclass
+class ParsedChunk:
+    """Result of parsing a streaming chunk."""
+    content: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    is_done: bool = False
+
+
+class StreamParser(ABC):
+    """Base class for streaming response parsers."""
+
+    @abstractmethod
+    def parse_line(self, line: str) -> ParsedChunk | None:
+        """Parse a single line from the stream. Returns None to skip the line."""
+        pass
+
+
+class OpenAIStreamParser(StreamParser):
+    """Parser for OpenAI-compatible streaming format.
+
+    Format: data: {"choices":[{"delta":{"content":"..."}}]}
+    """
+
+    def parse_line(self, line: str) -> ParsedChunk | None:
+        if not line.startswith("data:"):
+            return None
+
+        data = line[5:].lstrip()
+        if data == "[DONE]":
+            return ParsedChunk(is_done=True)
+
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+        result = ParsedChunk()
+
+        choices = chunk.get("choices", [])
+        if choices:
+            delta = choices[0].get("delta", {})
+            result.content = delta.get("content")
+
+        usage = chunk.get("usage")
+        if usage:
+            result.input_tokens = usage.get("prompt_tokens")
+            result.output_tokens = usage.get("completion_tokens")
+
+        return result
+
+
+class MasStreamParser(StreamParser):
+    """Parser for MAS streaming format.
+
+    Format: data:{"choices":[{"message":{"content":"..."}}]}
+    Events: event:{"usage":{"completionTokens":...,"promptTokens":...}}
+    """
+
+    def parse_line(self, line: str) -> ParsedChunk | None:
+        # Handle usage events
+        if line.startswith("event:"):
+            try:
+                event_data = json.loads(line[6:])
+                usage = event_data.get("usage", {})
+                if usage:
+                    return ParsedChunk(
+                        input_tokens=usage.get("promptTokens"),
+                        output_tokens=usage.get("completionTokens"),
+                    )
+            except json.JSONDecodeError:
+                pass
+            return None
+
+        if not line.startswith("data:"):
+            return None
+
+        data = line[5:].lstrip()
+        if data == "[DONE]":
+            return ParsedChunk(is_done=True)
+
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+        result = ParsedChunk()
+
+        choices = chunk.get("choices", [])
+        if choices:
+            message = choices[0].get("message", {})
+            result.content = message.get("content")
+
+        return result
+
+
+def detect_parser(line: str) -> StreamParser:
+    """Detect which parser to use based on the first data line."""
+    if line.startswith("data:"):
+        data = line[5:].lstrip()
+        try:
+            chunk = json.loads(data)
+            choices = chunk.get("choices", [])
+            if choices:
+                if "delta" in choices[0]:
+                    return OpenAIStreamParser()
+                elif "message" in choices[0]:
+                    return MasStreamParser()
+        except json.JSONDecodeError:
+            pass
+    return OpenAIStreamParser()  # Default to OpenAI format
+
+
+ParserType = Literal["openai", "mas", "auto"]
 
 
 @dataclass
@@ -25,6 +142,13 @@ class RequestMetrics:
         return self.output_tokens / self.total_time
 
     @property
+    def prefill_tps(self) -> float:
+        """Prefill tokens per second (input_tokens / TTFT)."""
+        if self.ttft is None or self.ttft <= 0 or self.input_tokens <= 0:
+            return 0.0
+        return self.input_tokens / self.ttft
+
+    @property
     def mean_inter_token_latency(self) -> float:
         """Mean time between tokens."""
         if not self.inter_token_latencies:
@@ -42,12 +166,14 @@ class OpenAIClient:
         api_key: str | None = None,
         timeout: float = 120.0,
         verify_ssl: bool = True,
+        parser: ParserType = "auto",
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.api_key = api_key
         self.timeout = timeout
         self.verify_ssl = verify_ssl
+        self.parser_type = parser
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -94,36 +220,34 @@ class OpenAIClient:
                         yield "", metrics
                         return
 
+                    # Initialize parser
+                    parser: StreamParser | None = None
+                    if self.parser_type == "openai":
+                        parser = OpenAIStreamParser()
+                    elif self.parser_type == "mas":
+                        parser = MasStreamParser()
+                    # else: auto-detect from first line
+
                     async for line in response.aiter_lines():
-                        if line.startswith("event:"):
-                            try:
-                                usage = json.loads(line[6:])
-                                if usage:
-                                    metrics.input_tokens = usage.get("promptTokens", 0)
-                                    if "completionTokens" in usage:
-                                        metrics.output_tokens = usage["completionTokens"]
-                            except json.JSONDecodeError:
-                                continue
-                        if not line.startswith("data:"):
+                        # Auto-detect parser from first data line
+                        if parser is None:
+                            parser = detect_parser(line)
+
+                        parsed = parser.parse_line(line)
+                        if parsed is None:
                             continue
 
-                        data = line[5:]  # Strip "data: " prefix
-                        if data == "[DONE]":
+                        if parsed.is_done:
                             break
 
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
+                        # Update usage metrics if provided
+                        if parsed.input_tokens is not None:
+                            metrics.input_tokens = parsed.input_tokens
+                        if parsed.output_tokens is not None:
+                            metrics.output_tokens = parsed.output_tokens
 
-                        # Extract content from delta
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
-
-                        message = choices[0].get("message", {})
-                        content = message.get("content", "")
-                        if content:
+                        # Handle content
+                        if parsed.content:
                             now = time.perf_counter()
 
                             if not first_token_received:
@@ -134,14 +258,7 @@ class OpenAIClient:
 
                             last_token_time = now
                             metrics.output_tokens += 1
-                            yield content, metrics
-
-                        # Check for usage info (some APIs include it)
-                        usage = chunk.get("usage")
-                        if usage:
-                            metrics.input_tokens = usage.get("promptTokens", 0)
-                            if "completionTokens" in usage:
-                                metrics.output_tokens = usage["completionTokens"]
+                            yield parsed.content, metrics
 
         except httpx.TimeoutException:
             metrics.error = "Request timed out"
