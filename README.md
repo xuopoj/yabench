@@ -8,20 +8,19 @@ OpenAI 兼容 LLM API 的性能测试工具。单一二进制文件，无需运�
 
 ```bash
 # Linux x86_64
-curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-linux-x86_64 -o yabench
-chmod +x yabench
+curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-linux-x86_64 -o yabench && chmod +x yabench
 
 # Linux arm64
-curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-linux-arm64 -o yabench
-chmod +x yabench
+curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-linux-arm64 -o yabench && chmod +x yabench
 
 # macOS (Apple Silicon)
-curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-darwin-arm64 -o yabench
-chmod +x yabench
+curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-darwin-arm64 -o yabench && chmod +x yabench
 
 # macOS (Intel)
-curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-darwin-x86_64 -o yabench
-chmod +x yabench
+curl -L https://github.com/xuopoj/yabench/releases/latest/download/yabench-darwin-x86_64 -o yabench && chmod +x yabench
+
+# Windows (PowerShell)
+Invoke-WebRequest https://github.com/xuopoj/yabench/releases/latest/download/yabench-windows-x86_64.exe -OutFile yabench.exe
 ```
 
 从源码编译：
