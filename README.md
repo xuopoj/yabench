@@ -134,7 +134,6 @@ yabench --print-dataset alpaca-zh -n 5  # 预览数据集内容
 
 | 类型 | 请求头 | 配置字段 |
 |------|--------|----------|
-| `token` | `X-Auth-Token` | `token` |
 | `api_key` | `Authorization: Bearer` | `api_key` |
 | `iam` | `X-Auth-Token`（自动获取） | `iam_url`、`domain`、`username`、`password`、`project` |
 
