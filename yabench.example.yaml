@@ -1,5 +1,29 @@
 # yabench config example
-# Copy to yabench.yaml and customize
+# Run `yabench --init` to create yabench.yaml from this template
+
+# Auth providers — define once, reference by name in tasks
+auth:
+  # Huawei Cloud IAM (auto-fetches token before each run)
+  hw-iam:
+    type: iam
+    iam_url: https://iam.cn-north-4.myhuaweicloud.com
+    domain: your-account-name
+    username: your-username
+    password: ${IAM_PASSWORD}
+    project: cn-north-4
+
+  local-iam:
+    type: iam
+    iam_url: https://iam.some-org.com
+    domain: your-account-name
+    username: your-username
+    password: ${IAM_PASSWORD}
+    project: cn-global-1
+
+  # API key (Authorization: Bearer header)
+  api_key:
+    type: api_key
+    api_key: <API_KEY>
 
 # Global defaults (inherited by all tasks)
 defaults:
@@ -14,31 +38,18 @@ defaults:
 tasks:
   local:
     base_url: http://localhost:8000/v1
-    model: gpt-4
+    model: my-model
+    auth: local-iam
 
-  prod:
-    base_url: https://api.example.com/v1
-    model: llama-3
-    token: ${YABENCH_TOKEN}
-    num_requests: 100
-    concurrency: 10
-
-  openai:
-    base_url: https://api.openai.com/v1
-    model: gpt-4o-mini
-    api_key: ${OPENAI_API_KEY}
-    no_verify_ssl: false
-
-  # Example with ShareGPT dataset (real-world prompts)
-  realistic:
-    base_url: http://localhost:8000/v1
-    model: llama-3
-    dataset: sharegpt  # Built-in: sharegpt, sharegpt-small
-    num_requests: 100
-    concurrency: 10
+  huaweicloud:
+    base_url: https://your-endpoint/v1
+    model: placeholder
+    auth: hw-iam
+    dataset: alpaca-zh
+    concurrency: 4
 
   # Custom dataset from local file
   custom:
     base_url: http://localhost:8000/v1
-    dataset: /path/to/prompts.jsonl  # or .json, .txt
+    dataset: /path/to/prompts.jsonl
     shuffle: true
