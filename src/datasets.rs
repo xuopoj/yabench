@@ -331,6 +331,279 @@ fn load_jsonl_bytes(bytes: &[u8], max_prompts: Option<usize>) -> Result<Vec<Prom
     Ok(prompts)
 }
 
+/// Parse a single dataset entry into an ordered list of (role, content) turns.
+/// Recognized formats:
+///   - {"conversations": [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}  (ShareGPT)
+///   - {"messages":      [{"role": "user",  "content": "..."}, {"role": "assistant", "content": "..."}]}  (OpenAI)
+fn parse_conversation(item: &Value) -> Option<Vec<(String, String)>> {
+    let mut turns: Vec<(String, String)> = Vec::new();
+
+    if let Some(convs) = item.get("conversations").and_then(|v| v.as_array()) {
+        for msg in convs {
+            let from = msg.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let val = msg.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            let role = match from {
+                "human" | "user" => "user",
+                "gpt" | "chatgpt" | "assistant" | "bard" => "assistant",
+                "system" => "system",
+                _ => continue,
+            };
+            if val.trim().is_empty() {
+                continue;
+            }
+            turns.push((role.to_string(), val.to_string()));
+        }
+    } else if let Some(msgs) = item.get("messages").and_then(|v| v.as_array()) {
+        for msg in msgs {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.trim().is_empty() {
+                continue;
+            }
+            if !matches!(role, "user" | "assistant" | "system") {
+                continue;
+            }
+            turns.push((role.to_string(), content.to_string()));
+        }
+    } else {
+        return None;
+    }
+
+    if turns.iter().any(|(r, _)| r == "user") {
+        Some(turns)
+    } else {
+        None
+    }
+}
+
+/// Load multi-turn conversations from a dataset and expand each one into a
+/// sequence of "growing-prefix" requests:
+///
+///   conversation = [u1, a1, u2, a2, u3, a3]
+///
+/// becomes three requests:
+///
+///   req 1: [u1]
+///   req 2: [u1, a1, u2]
+///   req 3: [u1, a1, u2, a2, u3]
+///
+/// Requests are emitted in **round-robin order across conversations**, so the
+/// output looks like:
+///
+///   conv1.turn1, conv2.turn1, conv3.turn1, …, conv1.turn2, conv2.turn2, …
+///
+/// This mimics real chat traffic — many independent sessions each progressing
+/// one turn at a time — and means consecutive concurrent requests hit
+/// *different* conversations' prefixes, not the same one. That keeps cache
+/// pressure realistic at higher concurrency.
+pub async fn load_multi_turn(
+    source: &str,
+    max_requests: usize,
+    max_turns_per_conversation: Option<usize>,
+) -> Result<Vec<Value>> {
+    let raw_items: Vec<Value> = if let Some(bytes) = embedded_dataset(source) {
+        parse_jsonl_items(bytes)?
+    } else if REMOTE_DATASETS.iter().any(|(n, _)| *n == source) {
+        let path = get_remote_cache_path(source).unwrap();
+        if !path.exists() {
+            println!("Downloading {source} dataset...");
+            download_builtin(source, true).await?;
+            println!("Saved to {}", path.display());
+        }
+        load_raw_items(&path)?
+    } else {
+        let path = PathBuf::from(source);
+        if !path.exists() {
+            return Err(anyhow!("Dataset not found: '{source}'"));
+        }
+        load_raw_items(&path)?
+    };
+
+    // Default to capping each conversation at a few turns so the round-robin
+    // pulls from many conversations rather than going deep into one. If the
+    // caller explicitly set a higher cap, honor it.
+    let per_conv_cap = max_turns_per_conversation.unwrap_or(5);
+
+    // Step 1: expand each conversation into its growing-prefix request list.
+    let mut per_conversation: Vec<Vec<Value>> = Vec::new();
+    for item in &raw_items {
+        let Some(turns) = parse_conversation(item) else {
+            continue;
+        };
+
+        let mut prefix: Vec<Value> = Vec::new();
+        let mut user_turn_count = 0usize;
+        let mut conv_reqs: Vec<Value> = Vec::new();
+        for (role, content) in turns {
+            prefix.push(serde_json::json!({"role": role, "content": content}));
+            if role == "user" {
+                user_turn_count += 1;
+                conv_reqs.push(Value::Array(prefix.clone()));
+                if user_turn_count >= per_conv_cap {
+                    break;
+                }
+            }
+        }
+
+        if !conv_reqs.is_empty() {
+            per_conversation.push(conv_reqs);
+        }
+
+        // Stop loading more conversations once we have enough material for
+        // the round-robin. We want at least `ceil(max_requests / per_conv_cap)`
+        // conversations so each one contributes ~per_conv_cap turns.
+        let total_so_far: usize = per_conversation.iter().map(|c| c.len()).sum();
+        if total_so_far >= max_requests {
+            break;
+        }
+    }
+
+    if per_conversation.is_empty() {
+        return Err(anyhow!(
+            "No multi-turn conversations found in '{source}' \
+             (expected ShareGPT-style 'conversations' or OpenAI-style 'messages')"
+        ));
+    }
+
+    // Step 2: round-robin pull (conv1.t1, conv2.t1, …, conv1.t2, conv2.t2, …).
+    let mut requests: Vec<Value> = Vec::with_capacity(max_requests);
+    let mut turn_idx = 0usize;
+    loop {
+        let mut added_this_round = false;
+        for conv in &per_conversation {
+            if let Some(req) = conv.get(turn_idx) {
+                requests.push(req.clone());
+                added_this_round = true;
+                if requests.len() >= max_requests {
+                    return Ok(requests);
+                }
+            }
+        }
+        if !added_this_round {
+            // Every conversation exhausted before we hit max_requests.
+            break;
+        }
+        turn_idx += 1;
+    }
+
+    Ok(requests)
+}
+
+/// Build `num_requests` long prompts by concatenating entries from `corpus`,
+/// each padded to roughly `target_chars`. Cycles through the corpus on overflow.
+/// Each request starts at a different offset so prompts diverge — avoids
+/// accidental server-side prefix-cache hits across requests.
+///
+/// Truncation is char-boundary safe (works for non-ASCII content).
+pub fn pad_to_target_chars(
+    corpus: &[String],
+    num_requests: usize,
+    target_chars: usize,
+) -> Vec<String> {
+    if corpus.is_empty() || target_chars == 0 || num_requests == 0 {
+        return Vec::new();
+    }
+    let separator = "\n\n---\n\n";
+    let sep_chars = separator.chars().count();
+    let mut out = Vec::with_capacity(num_requests);
+
+    for req_i in 0..num_requests {
+        let mut idx = req_i.wrapping_mul(37) % corpus.len();
+        let mut buf = String::with_capacity(target_chars + 64);
+        let mut buf_chars: usize = 0;
+
+        while buf_chars < target_chars {
+            if buf_chars > 0 {
+                let remaining = target_chars - buf_chars;
+                if sep_chars <= remaining {
+                    buf.push_str(separator);
+                    buf_chars += sep_chars;
+                } else {
+                    for (i, c) in separator.chars().enumerate() {
+                        if i >= remaining {
+                            break;
+                        }
+                        buf.push(c);
+                    }
+                    break;
+                }
+            }
+            let entry = &corpus[idx % corpus.len()];
+            idx += 1;
+            let entry_chars = entry.chars().count();
+            let remaining = target_chars - buf_chars;
+            if entry_chars <= remaining {
+                buf.push_str(entry);
+                buf_chars += entry_chars;
+            } else {
+                let mut count = 0;
+                for c in entry.chars() {
+                    if count >= remaining {
+                        break;
+                    }
+                    buf.push(c);
+                    count += 1;
+                }
+                break;
+            }
+        }
+        out.push(buf);
+    }
+    out
+}
+
+/// Load a corpus suitable for padding (single user prompts, shuffled).
+/// Bounded so a 4GB ShareGPT cold-cache download doesn't get triggered for
+/// tiny benchmarks — we only need enough entries for diverse starting offsets.
+pub async fn load_corpus_for_padding(
+    source: &str,
+    num_requests: usize,
+    seed: u64,
+) -> Result<Vec<String>> {
+    let corpus_size = (num_requests.saturating_mul(100)).clamp(200, 5000);
+    let loaded = load_dataset(source, corpus_size, true, seed).await?;
+    Ok(loaded.into_iter().map(|p| p.text).collect())
+}
+
+fn parse_jsonl_items(bytes: &[u8]) -> Result<Vec<Value>> {
+    let text = std::str::from_utf8(bytes).context("dataset is not valid UTF-8")?;
+    let mut items = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str(line) {
+            items.push(v);
+        }
+    }
+    Ok(items)
+}
+
+fn load_raw_items(path: &Path) -> Result<Vec<Value>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('[') {
+        // JSON array
+        let data: Value = serde_json::from_str(&content)?;
+        Ok(data.as_array().cloned().unwrap_or_default())
+    } else {
+        // JSONL
+        let mut items = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str(line) {
+                items.push(v);
+            }
+        }
+        Ok(items)
+    }
+}
+
 pub async fn load_dataset(
     source: &str,
     num_prompts: usize,

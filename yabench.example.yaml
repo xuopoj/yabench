@@ -26,11 +26,14 @@ auth:
     api_key: <API_KEY>
 
 # Global defaults (inherited by all tasks)
+# `max_tokens` and `input_tokens` accept size suffixes: 4K, 32K, 128K, 1M
 defaults:
   num_requests: 10
   concurrency: 1
   max_tokens: 256
-  input_tokens: 100
+  # input_tokens: 0 (default) → prompts come from sharegpt multi-turn replay.
+  # Set to a positive value (e.g. 128K) to pad sharegpt content to that
+  # exact token count per request. Omit entirely to keep the default.
   timeout: 120
   no_verify_ssl: true
 
@@ -53,3 +56,24 @@ tasks:
     base_url: http://localhost:8000/v1
     dataset: /path/to/prompts.jsonl
     shuffle: true
+
+  # Long-context test: each request is padded to ~128K tokens of real
+  # ShareGPT content. Concurrency=1 because long prefill dominates wall time.
+  long-context-128k:
+    base_url: http://localhost:8000/v1
+    model: my-model
+    input_tokens: 128K
+    max_tokens: 1K
+    concurrency: 1
+    num_requests: 3
+    timeout: 600
+
+  # 1M-context smoke test. Increase timeout — prefill at this size is slow.
+  long-context-1m:
+    base_url: http://localhost:8000/v1
+    model: my-model
+    input_tokens: 1M
+    max_tokens: 1K
+    concurrency: 1
+    num_requests: 1
+    timeout: 1800

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::time::Instant;
+use serde_json::Value;
 use tokio::sync::Semaphore;
 
-use crate::client::{OpenAIClient, RequestMetrics};
+use crate::client::{single_user_message, OpenAIClient, RequestMetrics};
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkResult {
@@ -36,6 +37,8 @@ pub struct BenchmarkResult {
     // Token counts
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub input_tokens_estimated_count: usize,
+    pub output_tokens_estimated_count: usize,
 
     pub errors: Vec<String>,
     pub request_metrics: Vec<RequestMetrics>,
@@ -65,6 +68,8 @@ impl BenchmarkResult {
             prefill_tps_mean: 0.0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            input_tokens_estimated_count: 0,
+            output_tokens_estimated_count: 0,
             errors: vec![],
             request_metrics: vec![],
         }
@@ -126,6 +131,8 @@ fn compute_stats(result: &mut BenchmarkResult) {
 
     result.total_input_tokens = completed.iter().map(|m| m.input_tokens).sum();
     result.total_output_tokens = completed.iter().map(|m| m.output_tokens).sum();
+    result.input_tokens_estimated_count = completed.iter().filter(|m| m.input_tokens_estimated).count();
+    result.output_tokens_estimated_count = completed.iter().filter(|m| m.output_tokens_estimated).count();
 
     if result.total_duration > 0.0 {
         result.output_tps = result.total_output_tokens as f64 / result.total_duration;
@@ -150,11 +157,11 @@ pub struct BenchmarkConfig {
 
 pub async fn run_benchmark(
     client: Arc<OpenAIClient>,
-    prompts: Vec<String>,
+    messages_list: Vec<Value>,
     config: BenchmarkConfig,
     progress: Option<indicatif::ProgressBar>,
 ) -> BenchmarkResult {
-    let num_prompts = prompts.len();
+    let num_prompts = messages_list.len();
     let semaphore = Arc::new(Semaphore::new(config.concurrency));
     let model = config.model.map(Arc::new);
     let max_tokens = config.max_tokens;
@@ -162,7 +169,7 @@ pub async fn run_benchmark(
 
     // Warm-up phase
     if config.warmup > 0 {
-        let warmup_prompts: Vec<_> = prompts
+        let warmup_msgs: Vec<_> = messages_list
             .iter()
             .cycle()
             .take(config.warmup)
@@ -171,7 +178,7 @@ pub async fn run_benchmark(
         let warmup_sem = Arc::new(Semaphore::new(config.concurrency));
         let mut warmup_tasks = vec![];
 
-        for prompt in warmup_prompts {
+        for msgs in warmup_msgs {
             let client = Arc::clone(&client);
             let sem = Arc::clone(&warmup_sem);
             let model = model.clone();
@@ -179,7 +186,7 @@ pub async fn run_benchmark(
             warmup_tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 client
-                    .complete(&prompt, model.as_ref().map(|s| s.as_str()), max_tokens)
+                    .complete(&msgs, model.as_ref().map(|s| s.as_str()), max_tokens)
                     .await
             }));
         }
@@ -196,7 +203,7 @@ pub async fn run_benchmark(
 
     let mut tasks = vec![];
 
-    for prompt in prompts.iter().cloned() {
+    for msgs in messages_list.iter().cloned() {
         let client = Arc::clone(&client);
         let sem = Arc::clone(&semaphore);
         let model = model.clone();
@@ -208,7 +215,7 @@ pub async fn run_benchmark(
             let _permit = sem.acquire().await.unwrap();
 
             let mut metrics = client
-                .complete(&prompt, model.as_ref().map(|s| s.as_str()), max_tokens)
+                .complete(&msgs, model.as_ref().map(|s| s.as_str()), max_tokens)
                 .await;
 
             // Retry logic with exponential backoff
@@ -218,7 +225,7 @@ pub async fn run_benchmark(
                     tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
 
                     metrics = client
-                        .complete(&prompt, model.as_ref().map(|s| s.as_str()), max_tokens)
+                        .complete(&msgs, model.as_ref().map(|s| s.as_str()), max_tokens)
                         .await;
 
                     if metrics.error.is_none() {
@@ -285,16 +292,7 @@ pub async fn run_benchmark(
     result
 }
 
-pub fn generate_prompts(num_prompts: usize, input_tokens: usize) -> Vec<String> {
-    let base = "Write a detailed explanation about the following topic. Be thorough and comprehensive. ";
-    let filler = "Please provide more details. ";
-    let target_chars = input_tokens * 4;
-
-    let mut prompt = base.to_string();
-    while prompt.len() < target_chars {
-        prompt.push_str(filler);
-    }
-    prompt.truncate(target_chars);
-
-    vec![prompt; num_prompts]
+/// Wrap each plain-text prompt as a single-user-message conversation.
+pub fn prompts_to_messages(prompts: Vec<String>) -> Vec<Value> {
+    prompts.into_iter().map(|p| single_user_message(&p)).collect()
 }

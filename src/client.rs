@@ -4,12 +4,19 @@ use serde_json::Value;
 use std::time::Instant;
 use tokio_stream::StreamExt;
 
+/// Wrap a plain string prompt as a single user message.
+pub fn single_user_message(prompt: &str) -> Value {
+    serde_json::json!([{"role": "user", "content": prompt}])
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestMetrics {
     pub ttft: Option<f64>,
     pub total_time: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub input_tokens_estimated: bool,
+    pub output_tokens_estimated: bool,
     pub inter_token_latencies: Vec<f64>,
     pub error: Option<String>,
 }
@@ -21,6 +28,8 @@ impl RequestMetrics {
             total_time: 0.0,
             input_tokens: 0,
             output_tokens: 0,
+            input_tokens_estimated: false,
+            output_tokens_estimated: false,
             inter_token_latencies: vec![],
             error: None,
         }
@@ -158,6 +167,14 @@ pub struct OpenAIClient {
     timeout_secs: f64,
     verify_ssl: bool,
     pub debug: bool,
+    /// Shared system-role prefix prepended to every request. Used to exercise
+    /// server-side prefix caching.
+    pub system_prefix: Option<String>,
+    /// Chars per token for this server's tokenizer. Used when sizing synthetic
+    /// prompts and when the server doesn't return a usage block. 4.0 is the
+    /// English-BPE default; populate via `calibrate_tokenizer` for accuracy on
+    /// Chinese or other non-Latin scripts.
+    pub chars_per_token: f64,
 }
 
 impl OpenAIClient {
@@ -175,7 +192,77 @@ impl OpenAIClient {
             timeout_secs,
             verify_ssl,
             debug: false,
+            system_prefix: None,
+            chars_per_token: 4.0,
         })
+    }
+
+    /// Probe the server with one short non-streaming request to learn its
+    /// chars-per-token ratio. Sends `sample` with `max_tokens=1`, reads
+    /// `usage.prompt_tokens`. Returns `chars(sample) / prompt_tokens`.
+    /// Errors if the server doesn't return usage or the ratio is implausible.
+    pub async fn calibrate_tokenizer(
+        &self,
+        sample: &str,
+        model: Option<&str>,
+    ) -> Result<f64> {
+        let client = self.build_client()?;
+        let mut payload = serde_json::json!({
+            "messages": [{"role": "user", "content": sample}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": false,
+        });
+        if let Some(m) = model {
+            payload["model"] = Value::String(m.to_string());
+        }
+
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut req = client.post(&url).header("Content-Type", "application/json");
+        if let Some(token) = &self.token {
+            req = req.header("X-Auth-Token", token);
+        }
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+
+        let response = req
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("calibration request failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "calibration http_{}: {}",
+                status.as_u16(),
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("calibration response parse failed: {e}"))?;
+        let prompt_tokens = body
+            .get("usage")
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("server did not return usage.prompt_tokens"))?;
+
+        if prompt_tokens == 0 {
+            return Err(anyhow!("server returned prompt_tokens=0"));
+        }
+
+        let chars = sample.chars().count() as f64;
+        let ratio = chars / prompt_tokens as f64;
+
+        if !(0.3..=20.0).contains(&ratio) {
+            return Err(anyhow!("implausible chars/token ratio: {ratio:.2}"));
+        }
+
+        Ok(ratio)
     }
 
     fn build_client(&self) -> Result<Client> {
@@ -198,12 +285,13 @@ impl OpenAIClient {
         max_tokens: u32,
     ) -> Result<(String, RequestMetrics)> {
         use std::io::Write;
+        let messages = single_user_message(prompt);
         let mut metrics = RequestMetrics::new();
         let start = Instant::now();
         let mut full = String::new();
 
         let result: Result<()> = async {
-            self.stream_complete_with(prompt, model, max_tokens, &mut metrics, start, |chunk| {
+            self.stream_complete_with(&messages, model, max_tokens, &mut metrics, start, |chunk| {
                 full.push_str(chunk);
                 print!("{chunk}");
                 std::io::stdout().flush().ok();
@@ -224,14 +312,14 @@ impl OpenAIClient {
 
     pub async fn complete(
         &self,
-        prompt: &str,
+        messages: &Value,
         model: Option<&str>,
         max_tokens: u32,
     ) -> RequestMetrics {
         let mut metrics = RequestMetrics::new();
         let start = Instant::now();
 
-        let result = self.stream_complete_with(prompt, model, max_tokens, &mut metrics, start, |_| {}).await;
+        let result = self.stream_complete_with(messages, model, max_tokens, &mut metrics, start, |_| {}).await;
 
         metrics.total_time = start.elapsed().as_secs_f64();
 
@@ -246,7 +334,7 @@ impl OpenAIClient {
 
     async fn stream_complete_with(
         &self,
-        prompt: &str,
+        input_messages: &Value,
         model: Option<&str>,
         max_tokens: u32,
         metrics: &mut RequestMetrics,
@@ -255,11 +343,24 @@ impl OpenAIClient {
     ) -> Result<()> {
         let client = self.build_client()?;
 
+        // If a system_prefix is configured, prepend it as a system message.
+        // (Caller-supplied messages are otherwise sent verbatim.)
+        let messages = match (&self.system_prefix, input_messages.as_array()) {
+            (Some(prefix), Some(arr)) => {
+                let mut combined = Vec::with_capacity(arr.len() + 1);
+                combined.push(serde_json::json!({"role": "system", "content": prefix}));
+                combined.extend(arr.iter().cloned());
+                Value::Array(combined)
+            }
+            _ => input_messages.clone(),
+        };
+
         let mut payload = serde_json::json!({
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.0,
             "stream": true,
+            "stream_options": {"include_usage": true},
         });
 
         if let Some(m) = model {
@@ -314,10 +415,11 @@ impl OpenAIClient {
         let mut format: Option<StreamFormat> = None;
         let mut first_token = true;
         let mut last_token_time = start;
-        // chunk count fallback if no usage in stream
-        let mut chunk_count: u64 = 0;
-        // track whether we got usage from the stream
-        let mut got_usage = false;
+        // Track output characters so we can fall back to chars/4 if the server
+        // never sends a usage block. (SSE chunks ≠ tokens, so counting chunks is wrong.)
+        let mut output_chars: usize = 0;
+        let mut got_input_usage = false;
+        let mut got_output_usage = false;
         'outer: while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| anyhow!("stream error: {e}"))?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -353,11 +455,11 @@ impl OpenAIClient {
                 // Update usage if provided
                 if let Some(it) = parsed.input_tokens {
                     metrics.input_tokens = it;
-                    got_usage = true;
+                    got_input_usage = true;
                 }
                 if let Some(ot) = parsed.output_tokens {
                     metrics.output_tokens = ot;
-                    got_usage = true;
+                    got_output_usage = true;
                 }
 
                 // Handle content tokens
@@ -376,7 +478,7 @@ impl OpenAIClient {
                         }
 
                         last_token_time = now;
-                        chunk_count += 1;
+                        output_chars += content.chars().count();
                         on_content(content);
                     }
                 }
@@ -384,9 +486,28 @@ impl OpenAIClient {
 
         }
 
-        // Fall back to chunk count if no usage from stream
-        if !got_usage {
-            metrics.output_tokens = chunk_count;
+        // Fall back to chars/ratio estimate when the server didn't emit usage.
+        // The ratio is calibrated per server via `calibrate_tokenizer`; the
+        // default 4.0 matches English BPE.
+        let ratio = if self.chars_per_token > 0.0 { self.chars_per_token } else { 4.0 };
+        if !got_output_usage {
+            metrics.output_tokens = (output_chars as f64 / ratio) as u64;
+            metrics.output_tokens_estimated = true;
+        }
+        if !got_input_usage {
+            // Sum the chars of every "content" field in the final messages array
+            // (which already includes any prepended system_prefix).
+            let total_chars: usize = messages
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                        .map(|s| s.chars().count())
+                        .sum()
+                })
+                .unwrap_or(0);
+            metrics.input_tokens = (total_chars as f64 / ratio) as u64;
+            metrics.input_tokens_estimated = true;
         }
 
         Ok(())

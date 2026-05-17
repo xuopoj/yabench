@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod datasets;
 mod iam;
+mod perf;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,10 +13,17 @@ use clap::Parser;
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use benchmark::{run_benchmark, BenchmarkConfig, BenchmarkResult, generate_prompts};
+use benchmark::{run_benchmark, BenchmarkConfig, BenchmarkResult, prompts_to_messages};
 use client::OpenAIClient;
-use config::{find_config, load_config, AuthProvider, TaskConfig};
-use datasets::{download_all_datasets, download_builtin, load_dataset};
+use config::{find_config, load_config, parse_size, parse_size_u32, AuthProvider, TaskConfig};
+use datasets::{
+    download_all_datasets, download_builtin, load_corpus_for_padding, load_dataset,
+    load_multi_turn, pad_to_target_chars,
+};
+
+/// Default corpus used when no dataset is configured — small ShareGPT-GPT4
+/// subset, real conversations, downloads on first use.
+const DEFAULT_CORPUS: &str = "sharegpt-small";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,12 +71,12 @@ struct Cli {
     #[arg(short = 'c', long)]
     concurrency: Option<usize>,
 
-    /// Max tokens per response
-    #[arg(long)]
+    /// Max tokens per response (accepts 4K, 32K, 128K notation)
+    #[arg(long, value_parser = parse_size_u32)]
     max_tokens: Option<u32>,
 
-    /// Approximate input tokens per prompt
-    #[arg(long)]
+    /// Approximate input tokens per prompt (accepts 4K, 32K, 128K, 1M notation)
+    #[arg(long, value_parser = parse_size)]
     input_tokens: Option<usize>,
 
     /// Dataset name or file path
@@ -126,6 +134,220 @@ struct Cli {
     /// Send a single chat message and stream the response (e.g. --chat "hello")
     #[arg(long, value_name = "PROMPT")]
     chat: Option<String>,
+
+    /// Run the perf suite (concurrency sweep c=1,2,4,8) and write a markdown report.
+    /// Optional path; defaults to perf-report-{timestamp}.md
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    perf_report: Option<String>,
+
+    /// Prepend a synthetic ~N-token system prompt to every request, identical across requests.
+    /// Used to exercise server-side prefix caching.
+    #[arg(long, value_name = "N", conflicts_with = "prefix_file")]
+    prefix_tokens: Option<usize>,
+
+    /// Load a system prompt from file and prepend it to every request.
+    /// Used to exercise server-side prefix caching.
+    #[arg(long, value_name = "PATH")]
+    prefix_file: Option<PathBuf>,
+
+    /// Replay multi-turn conversations from the dataset as a sequence of
+    /// growing-prefix requests (turn 1, turns 1-2, turns 1-3, ...). Each
+    /// request reuses the previous request's content as its leading tokens —
+    /// exercises server-side prefix caching on a realistic chat workload.
+    /// Requires a dataset with ShareGPT-style conversations.
+    #[arg(long)]
+    multi_turn: bool,
+
+    /// Cap the number of turns replayed from each conversation (only applies
+    /// with --multi-turn). Default: replay all turns up to --num-requests.
+    #[arg(long, value_name = "N")]
+    max_turns_per_conversation: Option<usize>,
+}
+
+const SYSTEM_PREFIX_TEMPLATE: &str = "\
+You are a helpful and knowledgeable AI assistant. Answer questions clearly, accurately, and concisely. \
+When explaining technical topics, use plain language and concrete examples grounded in real-world scenarios. \
+If you do not know the answer to a question, say so directly rather than guessing or fabricating information. \
+Format code in fenced markdown code blocks with the appropriate language tag. \
+Format mathematical expressions using LaTeX notation when appropriate. \
+Be honest about uncertainty in your answers, and acknowledge when a question is ambiguous or could have multiple interpretations. \
+When asked to perform a task, do exactly what was requested without adding unsolicited improvements. \
+Maintain a neutral, professional tone in your responses. Cite sources when you reference specific facts, papers, or external information. \
+When discussing contested or controversial topics, present multiple perspectives fairly without advocating for a particular position. \
+Prefer concrete examples over abstract explanations when teaching new concepts. \
+Ask clarifying questions if the request is unclear or could be interpreted in more than one reasonable way. \
+Respect the user's time by being direct and avoiding unnecessary preamble. \
+When summarizing, preserve the original meaning and avoid introducing claims not supported by the source. \
+For step-by-step reasoning tasks, lay out your work explicitly so the reader can verify each step. \
+Prefer plain text over markdown when the response is going to be read in a terminal. \
+Avoid emojis and decorative formatting unless they materially aid understanding. \
+";
+
+fn generate_system_prefix(target_tokens: usize) -> String {
+    // chars/4 heuristic to roughly hit the token target.
+    let target_chars = target_tokens.saturating_mul(4);
+    let mut out = String::with_capacity(target_chars + SYSTEM_PREFIX_TEMPLATE.len());
+    while out.len() < target_chars {
+        out.push_str(SYSTEM_PREFIX_TEMPLATE);
+    }
+    // Truncate at a UTF-8 char boundary. Template is ASCII so any byte index works,
+    // but be defensive in case it's edited later.
+    while !out.is_char_boundary(target_chars.min(out.len())) {
+        out.pop();
+    }
+    out.truncate(target_chars);
+    out
+}
+
+/// One of the four ways we produce a list of chat requests:
+///   - `Ready`: messages already constructed (real dataset prompts, or
+///     multi-turn replay) — calibration just samples from the first one.
+///   - `Pad`: corpus loaded but not yet sized — we calibrate first, then
+///     concatenate corpus entries to hit `input_tokens × chars_per_token`.
+enum Source {
+    Ready(Vec<serde_json::Value>),
+    Pad { corpus: Vec<String>, input_tokens: usize },
+}
+
+fn first_user_content(msgs: &[serde_json::Value]) -> Option<String> {
+    msgs.first()
+        .and_then(|m| m.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(String::from)
+}
+
+/// Resolve the request source from task config + flags.
+/// Priority: explicit --multi-turn > explicit dataset > input_tokens (pad) > default sharegpt multi-turn.
+async fn resolve_source(
+    task: &TaskConfig,
+    multi_turn_flag: bool,
+    max_turns: Option<usize>,
+    num_requests: usize,
+    quiet: bool,
+) -> Result<Source> {
+    if multi_turn_flag {
+        let dataset = task.dataset.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--multi-turn requires a dataset (set `dataset:` in the task or pass --dataset)")
+        })?;
+        if !quiet {
+            println!("Loading multi-turn conversations from {dataset}...");
+        }
+        let msgs = load_multi_turn(dataset, num_requests, max_turns).await?;
+        if !quiet {
+            println!("Loaded {} growing-prefix requests", msgs.len());
+        }
+        Ok(Source::Ready(msgs))
+    } else if let Some(dataset) = &task.dataset {
+        if !quiet {
+            println!("Loading dataset {dataset}...");
+        }
+        let loaded = load_dataset(dataset, num_requests, task.shuffle, task.seed).await?;
+        if !quiet {
+            println!("Loaded {} prompts (seed={})", loaded.len(), task.seed);
+        }
+        Ok(Source::Ready(prompts_to_messages(
+            loaded.into_iter().map(|p| p.text).collect(),
+        )))
+    } else if task.input_tokens > 0 {
+        if !quiet {
+            println!(
+                "Padding prompts from {DEFAULT_CORPUS} to ~{} tokens each...",
+                task.input_tokens
+            );
+        }
+        let corpus = load_corpus_for_padding(DEFAULT_CORPUS, num_requests, task.seed).await?;
+        if !quiet {
+            println!("Loaded corpus of {} entries", corpus.len());
+        }
+        Ok(Source::Pad {
+            corpus,
+            input_tokens: task.input_tokens,
+        })
+    } else {
+        if !quiet {
+            println!("Using {DEFAULT_CORPUS} multi-turn conversations (default)...");
+        }
+        let msgs = load_multi_turn(DEFAULT_CORPUS, num_requests, max_turns).await?;
+        if !quiet {
+            println!("Loaded {} growing-prefix requests", msgs.len());
+        }
+        Ok(Source::Ready(msgs))
+    }
+}
+
+fn build_messages(source: Source, num_requests: usize, ratio: f64) -> Vec<serde_json::Value> {
+    match source {
+        Source::Ready(msgs) => msgs,
+        Source::Pad {
+            corpus,
+            input_tokens,
+        } => {
+            let target_chars = (input_tokens as f64 * ratio) as usize;
+            let prompts = pad_to_target_chars(&corpus, num_requests, target_chars);
+            prompts_to_messages(prompts)
+        }
+    }
+}
+
+/// Probe the server for its chars-per-token ratio. Falls back to 4.0 on any
+/// failure and prints a one-line note so the user knows whether calibration
+/// succeeded.
+async fn calibrate_with_fallback(
+    client: &OpenAIClient,
+    sample: &str,
+    model: Option<&str>,
+    quiet: bool,
+) -> f64 {
+    // Cap probe length — a few hundred chars is plenty for a stable ratio and
+    // keeps the probe cheap on slow servers.
+    let probe: String = sample.chars().take(500).collect();
+    if probe.trim().is_empty() {
+        if !quiet {
+            println!("  Tokenizer:   default 4.0 chars/token (no probe sample available)");
+        }
+        return 4.0;
+    }
+    match client.calibrate_tokenizer(&probe, model).await {
+        Ok(ratio) => {
+            if !quiet {
+                println!("  Tokenizer:   1 token ≈ {:.2} chars (calibrated)", ratio);
+            }
+            ratio
+        }
+        Err(e) => {
+            if !quiet {
+                println!(
+                    "  Tokenizer:   default 4.0 chars/token (calibration failed: {})",
+                    e.to_string().chars().take(80).collect::<String>()
+                );
+            }
+            4.0
+        }
+    }
+}
+
+fn resolve_prefix(cli: &Cli) -> Result<Option<String>> {
+    if let Some(n) = cli.prefix_tokens {
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(generate_system_prefix(n)))
+    } else if let Some(path) = &cli.prefix_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read prefix file {}", path.display()))?;
+        if content.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(content))
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 fn get_task_config(cli: &Cli) -> Result<(TaskConfig, Option<config::Config>)> {
@@ -186,7 +408,7 @@ fn get_task_config(cli: &Cli) -> Result<(TaskConfig, Option<config::Config>)> {
         num_requests: cli.num_requests.unwrap_or(10),
         concurrency: cli.concurrency.unwrap_or(1),
         max_tokens: cli.max_tokens.unwrap_or(256),
-        input_tokens: cli.input_tokens.unwrap_or(100),
+        input_tokens: cli.input_tokens.unwrap_or(0),
         timeout: cli.timeout.unwrap_or(120.0),
         verify_ssl: !cli.no_verify_ssl,
         no_verify_ssl: None,
@@ -248,15 +470,33 @@ fn print_summary(result: &BenchmarkResult, task: &TaskConfig) {
 
     println!("{}", bold.apply_to("Tokens:"));
     let n = result.num_completed.max(1);
+    let input_suffix = if result.input_tokens_estimated_count > 0 {
+        format!(
+            ", {} estimated",
+            yellow.apply_to(result.input_tokens_estimated_count)
+        )
+    } else {
+        String::new()
+    };
+    let output_suffix = if result.output_tokens_estimated_count > 0 {
+        format!(
+            ", {} estimated",
+            yellow.apply_to(result.output_tokens_estimated_count)
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "  Input   {} total  (mean: {:.1})",
+        "  Input   {} total  (mean: {:.1}{})",
         result.total_input_tokens,
-        result.total_input_tokens as f64 / n as f64
+        result.total_input_tokens as f64 / n as f64,
+        input_suffix,
     );
     println!(
-        "  Output  {} total  (mean: {:.1})",
+        "  Output  {} total  (mean: {:.1}{})",
         result.total_output_tokens,
-        result.total_output_tokens as f64 / n as f64
+        result.total_output_tokens as f64 / n as f64,
+        output_suffix,
     );
 
     if !result.errors.is_empty() {
@@ -306,6 +546,8 @@ fn result_to_json(result: &BenchmarkResult) -> serde_json::Value {
         "tokens": {
             "input": result.total_input_tokens,
             "output": result.total_output_tokens,
+            "input_estimated_count": result.input_tokens_estimated_count,
+            "output_estimated_count": result.output_tokens_estimated_count,
         },
         "errors": result.errors,
     })
@@ -329,6 +571,7 @@ fn write_csv(path: &PathBuf, result: &BenchmarkResult, task: &TaskConfig) -> Res
         "e2e_mean", "e2e_p50", "e2e_p95", "e2e_p99",
         "inter_token_latency_mean",
         "total_input_tokens", "total_output_tokens",
+        "input_tokens_estimated", "output_tokens_estimated",
     ];
 
     if !file_exists {
@@ -337,7 +580,7 @@ fn write_csv(path: &PathBuf, result: &BenchmarkResult, task: &TaskConfig) -> Res
 
     writeln!(
         writer,
-        "{},{},{},{},{},{},{:.6},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{}",
+        "{},{},{},{},{},{},{:.6},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{}",
         task.name,
         task.dataset.as_deref().unwrap_or(""),
         task.concurrency,
@@ -362,12 +605,22 @@ fn write_csv(path: &PathBuf, result: &BenchmarkResult, task: &TaskConfig) -> Res
         result.inter_token_latency_mean,
         result.total_input_tokens,
         result.total_output_tokens,
+        result.input_tokens_estimated_count,
+        result.output_tokens_estimated_count,
     )?;
 
     Ok(())
 }
 
-async fn run_task(task: &TaskConfig, output: Option<&str>, quiet: bool, debug: bool) -> Result<i32> {
+async fn run_task(
+    task: &TaskConfig,
+    output: Option<&str>,
+    quiet: bool,
+    debug: bool,
+    prefix: Option<String>,
+    multi_turn: bool,
+    max_turns: Option<usize>,
+) -> Result<i32> {
     let mut client = OpenAIClient::new(
         task.base_url.clone(),
         task.token.clone(),
@@ -376,7 +629,7 @@ async fn run_task(task: &TaskConfig, output: Option<&str>, quiet: bool, debug: b
         task.effective_verify_ssl(),
     )?;
     client.debug = debug;
-    let client = Arc::new(client);
+    client.system_prefix = prefix.clone();
 
     if !quiet {
         println!("yabench — Running task: {}", task.name);
@@ -393,26 +646,37 @@ async fn run_task(task: &TaskConfig, output: Option<&str>, quiet: bool, debug: b
         if task.warmup > 0 {
             println!("  Warmup:      {} requests", task.warmup);
         }
+        if let Some(p) = &prefix {
+            let approx_tokens = (p.chars().count() / 4).max(1);
+            println!("  Prefix:      ~{approx_tokens} tokens (system message)");
+        }
         println!();
     }
 
-    // Load prompts
-    let prompts: Vec<String> = if let Some(dataset) = &task.dataset {
-        if !quiet {
-            println!("Loading dataset...");
-        }
-        let loaded = load_dataset(dataset, task.num_requests, task.shuffle, task.seed).await?;
-        if !quiet {
-            println!("Loaded {} prompts (seed={})", loaded.len(), task.seed);
-            println!();
-        }
-        loaded.into_iter().map(|p| p.text).collect()
-    } else {
-        generate_prompts(task.num_requests, task.input_tokens)
-    };
+    let source = resolve_source(task, multi_turn, max_turns, task.num_requests, quiet).await?;
 
+    let calibration_sample: String = match &source {
+        Source::Ready(msgs) => first_user_content(msgs)
+            .unwrap_or_else(|| SYSTEM_PREFIX_TEMPLATE.to_string()),
+        Source::Pad { corpus, .. } => corpus
+            .first()
+            .cloned()
+            .unwrap_or_else(|| SYSTEM_PREFIX_TEMPLATE.to_string()),
+    };
+    let ratio =
+        calibrate_with_fallback(&client, &calibration_sample, task.model.as_deref(), quiet).await;
+    client.chars_per_token = ratio;
+    if !quiet {
+        println!();
+    }
+
+    let messages_list = build_messages(source, task.num_requests, ratio);
+
+    let client = Arc::new(client);
+
+    let num_requests = messages_list.len();
     let pb = if !quiet {
-        let bar = ProgressBar::new(task.num_requests as u64);
+        let bar = ProgressBar::new(num_requests as u64);
         bar.set_style(
             ProgressStyle::default_bar()
                 .template("[{pos}/{len}] {msg}")
@@ -431,7 +695,7 @@ async fn run_task(task: &TaskConfig, output: Option<&str>, quiet: bool, debug: b
         max_retries: task.retries,
     };
 
-    let result = run_benchmark(client, prompts, bench_config, pb).await;
+    let result = run_benchmark(client, messages_list, bench_config, pb).await;
 
     if !quiet {
         print_summary(&result, task);
@@ -485,6 +749,7 @@ async fn main() -> Result<()> {
             task.effective_verify_ssl(),
         )?;
         client.debug = cli.debug;
+        client.system_prefix = resolve_prefix(&cli)?;
         let (_, metrics) = client.chat(prompt, task.model.as_deref(), task.max_tokens.max(512)).await?;
         eprintln!("\n[TTFT: {:.3}s | tokens: {} | {:.2}s total]",
             metrics.ttft.unwrap_or(0.0),
@@ -585,7 +850,97 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    let exit_code = run_task(&task, cli.output.as_deref(), cli.quiet, cli.debug).await?;
+    if let Some(report_path) = cli.perf_report.as_ref() {
+        let suite_cfg = perf::PerfSuiteConfig::default();
+        let prefix = resolve_prefix(&cli)?;
+
+        let mut client = OpenAIClient::new(
+            task.base_url.clone(),
+            task.token.clone(),
+            task.api_key.clone(),
+            task.timeout,
+            task.effective_verify_ssl(),
+        )?;
+        client.debug = cli.debug;
+        client.system_prefix = prefix.clone();
+
+        let source = resolve_source(
+            &task,
+            cli.multi_turn,
+            cli.max_turns_per_conversation,
+            suite_cfg.n_per_level,
+            cli.quiet,
+        )
+        .await?;
+
+        let calibration_sample: String = match &source {
+            Source::Ready(msgs) => first_user_content(msgs)
+                .unwrap_or_else(|| SYSTEM_PREFIX_TEMPLATE.to_string()),
+            Source::Pad { corpus, .. } => corpus
+                .first()
+                .cloned()
+                .unwrap_or_else(|| SYSTEM_PREFIX_TEMPLATE.to_string()),
+        };
+        let ratio = calibrate_with_fallback(
+            &client,
+            &calibration_sample,
+            task.model.as_deref(),
+            cli.quiet,
+        )
+        .await;
+        client.chars_per_token = ratio;
+
+        let messages_list = build_messages(source, suite_cfg.n_per_level, ratio);
+        let client = Arc::new(client);
+
+        let final_path = if report_path.is_empty() {
+            format!(
+                "perf-report-{}.md",
+                perf::format_filename_timestamp(perf::now_secs())
+            )
+        } else {
+            report_path.clone()
+        };
+
+        if !cli.quiet {
+            println!("yabench perf suite");
+            println!("  task:        {}", task.name);
+            println!("  endpoint:    {}", task.base_url);
+            println!("  concurrency: {:?}", suite_cfg.concurrencies);
+            println!("  per-level n: {}", suite_cfg.n_per_level);
+            if let Some(p) = &prefix {
+                let approx_tokens = (p.chars().count() / 4).max(1);
+                println!("  prefix:      ~{approx_tokens} tokens (system message)");
+            }
+            println!("  output:      {}", final_path);
+            println!();
+        }
+
+        let report =
+            perf::run_perf_suite(client, messages_list, &task, &suite_cfg, cli.quiet).await?;
+
+        let md = perf::format_markdown(&report);
+        std::fs::write(&final_path, &md)
+            .with_context(|| format!("Failed to write {}", final_path))?;
+
+        if !cli.quiet {
+            println!("\nReport written to {}", final_path);
+        }
+
+        return Ok(());
+    }
+
+    let prefix = resolve_prefix(&cli)?;
+    let exit_code = run_task(
+        &task,
+        cli.output.as_deref(),
+        cli.quiet,
+        cli.debug,
+        prefix,
+        cli.multi_turn,
+        cli.max_turns_per_conversation,
+    )
+    .await?;
 
     std::process::exit(exit_code);
 }

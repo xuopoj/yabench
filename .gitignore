@@ -4,5 +4,8 @@
 # Config (contains secrets)
 yabench.yaml
 
+# Local benchmark reports — endpoint URLs and timing data
+/reports/
+
 # macOS
 .DS_Store
