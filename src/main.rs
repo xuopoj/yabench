@@ -123,6 +123,10 @@ struct Cli {
     #[arg(long)]
     init: bool,
 
+    /// Print the full usage guide in markdown
+    #[arg(long)]
+    guide: bool,
+
     /// Number of warmup requests
     #[arg(long, default_value = "0")]
     warmup: usize,
@@ -791,6 +795,12 @@ async fn main() -> Result<()> {
         }
         std::fs::write(path, include_str!("../yabench.example.yaml"))?;
         println!("Created yabench.yaml — edit it to configure your tasks.");
+        return Ok(());
+    }
+
+    // Handle --guide
+    if cli.guide {
+        print!("{}", include_str!("../docs/guide.md"));
         return Ok(());
     }
 

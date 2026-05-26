@@ -77,3 +77,17 @@ tasks:
     concurrency: 1
     num_requests: 1
     timeout: 1800
+
+# Performance matrix examples (run with --perf-matrix):
+#
+#   yabench local --perf-matrix
+#     Uses default grid: input [1K,4K,16K,64K,128K] × output [256,1K,4K,16K,64K] × c [1,4,8]
+#
+#   yabench local --perf-matrix --matrix-n 20
+#     20 requests per cell instead of the default 10
+#
+#   yabench local --perf-matrix --matrix-input 1K,4K,32K --matrix-output 256,1K,8K --matrix-concurrency 1,4
+#     Custom grid: 3×3×2 = 18 cells
+#
+#   yabench local --perf-matrix --timeout 600
+#     Increase timeout for cells with long input + long output
