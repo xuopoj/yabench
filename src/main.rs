@@ -140,6 +140,27 @@ struct Cli {
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     perf_report: Option<String>,
 
+    /// Run a performance matrix: sweep input_tokens × output_tokens × concurrency.
+    /// Produces a flat markdown table. Optional path; defaults to perf-matrix-{timestamp}.md
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    perf_matrix: Option<String>,
+
+    /// Requests per cell in the perf matrix (default: 10)
+    #[arg(long, default_value = "10")]
+    matrix_n: usize,
+
+    /// Input token sizes for the perf matrix (comma-separated, e.g. "1K,4K,32K,128K")
+    #[arg(long, value_name = "SIZES", value_delimiter = ',', value_parser = parse_size)]
+    matrix_input: Option<Vec<usize>>,
+
+    /// Output token sizes for the perf matrix (comma-separated, e.g. "256,1K,8K,64K")
+    #[arg(long, value_name = "SIZES", value_delimiter = ',', value_parser = parse_size_u32)]
+    matrix_output: Option<Vec<u32>>,
+
+    /// Concurrency levels for the perf matrix (comma-separated, e.g. "1,2,4,8,16")
+    #[arg(long, value_name = "LEVELS", value_delimiter = ',')]
+    matrix_concurrency: Option<Vec<usize>>,
+
     /// Prepend a synthetic ~N-token system prompt to every request, identical across requests.
     /// Used to exercise server-side prefix caching.
     #[arg(long, value_name = "N", conflicts_with = "prefix_file")]
@@ -925,6 +946,80 @@ async fn main() -> Result<()> {
 
         if !cli.quiet {
             println!("\nReport written to {}", final_path);
+        }
+
+        return Ok(());
+    }
+
+    if let Some(matrix_path) = cli.perf_matrix.as_ref() {
+        let prefix = resolve_prefix(&cli)?;
+
+        let mut client = OpenAIClient::new(
+            task.base_url.clone(),
+            task.token.clone(),
+            task.api_key.clone(),
+            task.timeout,
+            task.effective_verify_ssl(),
+        )?;
+        client.debug = cli.debug;
+        client.system_prefix = prefix.clone();
+
+        let mut matrix_cfg = perf::MatrixConfig {
+            n_per_cell: cli.matrix_n,
+            ..Default::default()
+        };
+        if let Some(ref v) = cli.matrix_input { matrix_cfg.input_tokens = v.clone(); }
+        if let Some(ref v) = cli.matrix_output { matrix_cfg.output_tokens = v.clone(); }
+        if let Some(ref v) = cli.matrix_concurrency { matrix_cfg.concurrencies = v.clone(); }
+
+        let corpus = load_corpus_for_padding(DEFAULT_CORPUS, matrix_cfg.n_per_cell, task.seed).await?;
+
+        let sample = corpus.first().cloned().unwrap_or_else(|| SYSTEM_PREFIX_TEMPLATE.to_string());
+        let ratio = calibrate_with_fallback(&client, &sample, task.model.as_deref(), cli.quiet).await;
+        client.chars_per_token = ratio;
+
+        let client = Arc::new(client);
+
+        let final_path = if matrix_path.is_empty() {
+            format!(
+                "perf-matrix-{}.md",
+                perf::format_filename_timestamp(perf::now_secs())
+            )
+        } else {
+            matrix_path.clone()
+        };
+
+        let total_cells = matrix_cfg.input_tokens.len()
+            * matrix_cfg.output_tokens.len()
+            * matrix_cfg.concurrencies.len();
+
+        if !cli.quiet {
+            println!("yabench perf matrix");
+            println!("  task:        {}", task.name);
+            println!("  endpoint:    {}", task.base_url);
+            println!("  grid:        {} input × {} output × {} concurrency = {} cells",
+                matrix_cfg.input_tokens.len(),
+                matrix_cfg.output_tokens.len(),
+                matrix_cfg.concurrencies.len(),
+                total_cells,
+            );
+            println!("  per-cell n:  {}", matrix_cfg.n_per_cell);
+            if let Some(p) = &prefix {
+                let approx_tokens = (p.chars().count() / 4).max(1);
+                println!("  prefix:      ~{approx_tokens} tokens (system message)");
+            }
+            println!("  output:      {}", final_path);
+            println!();
+        }
+
+        let report = perf::run_perf_matrix(client, &corpus, &task, &matrix_cfg, cli.quiet).await?;
+
+        let md = perf::format_matrix_markdown(&report);
+        std::fs::write(&final_path, &md)
+            .with_context(|| format!("Failed to write {}", final_path))?;
+
+        if !cli.quiet {
+            println!("\nMatrix report written to {}", final_path);
         }
 
         return Ok(());

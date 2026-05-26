@@ -5,9 +5,10 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 
-use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkResult};
+use crate::benchmark::{run_benchmark, prompts_to_messages, BenchmarkConfig, BenchmarkResult};
 use crate::client::{single_user_message, OpenAIClient};
 use crate::config::TaskConfig;
+use crate::datasets::pad_to_target_chars;
 
 pub struct SweepEntry {
     pub concurrency: usize,
@@ -460,6 +461,201 @@ pub fn format_markdown(report: &PerfReport) -> String {
         "Each level has n={} samples. p50 and p75 are trustworthy; p95 is the 1-2 slowest requests; p99 is essentially the single slowest and may be a fluke. For honest tail latency, rerun the chosen concurrency level with at least n=200.",
         n,
     );
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Performance matrix: input_tokens × output_tokens × concurrency
+// ---------------------------------------------------------------------------
+
+pub struct MatrixCell {
+    pub input_tokens: usize,
+    pub output_tokens: u32,
+    pub concurrency: usize,
+    pub result: BenchmarkResult,
+}
+
+pub struct MatrixReport {
+    pub task_name: String,
+    pub base_url: String,
+    pub model: Option<String>,
+    pub n_per_cell: usize,
+    pub timestamp_secs: u64,
+    pub total_duration: f64,
+    pub cells: Vec<MatrixCell>,
+}
+
+pub struct MatrixConfig {
+    pub input_tokens: Vec<usize>,
+    pub output_tokens: Vec<u32>,
+    pub concurrencies: Vec<usize>,
+    pub n_per_cell: usize,
+}
+
+impl Default for MatrixConfig {
+    fn default() -> Self {
+        Self {
+            input_tokens: vec![1_000, 4_000, 16_000, 64_000, 128_000],
+            output_tokens: vec![256, 1_000, 4_000, 16_000, 64_000],
+            concurrencies: vec![1, 4, 8],
+            n_per_cell: 10,
+        }
+    }
+}
+
+fn format_token_count(n: usize) -> String {
+    if n >= 1_000_000 && n % 1_000_000 == 0 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 && n % 1_000 == 0 {
+        format!("{}K", n / 1_000)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
+pub async fn run_perf_matrix(
+    client: Arc<OpenAIClient>,
+    corpus: &[String],
+    task: &TaskConfig,
+    cfg: &MatrixConfig,
+    quiet: bool,
+) -> Result<MatrixReport> {
+    let suite_start = Instant::now();
+    let timestamp_secs = now_secs();
+
+    let total_cells = cfg.input_tokens.len() * cfg.output_tokens.len() * cfg.concurrencies.len();
+    let mut cells = Vec::with_capacity(total_cells);
+    let mut cell_idx = 0usize;
+
+    for &input_tok in &cfg.input_tokens {
+        let target_chars = (input_tok as f64 * client.chars_per_token) as usize;
+        let prompts = pad_to_target_chars(corpus, cfg.n_per_cell, target_chars);
+        let messages_list = prompts_to_messages(prompts);
+
+        for &output_tok in &cfg.output_tokens {
+            for &c in &cfg.concurrencies {
+                cell_idx += 1;
+                if !quiet {
+                    println!(
+                        "[{}/{}] input={} output={} c={}",
+                        cell_idx,
+                        total_cells,
+                        format_token_count(input_tok),
+                        format_token_count(output_tok as usize),
+                        c,
+                    );
+                }
+
+                let msgs: Vec<Value> = messages_list
+                    .iter()
+                    .cycle()
+                    .take(cfg.n_per_cell)
+                    .cloned()
+                    .collect();
+
+                let bench_cfg = BenchmarkConfig {
+                    model: task.model.clone(),
+                    max_tokens: output_tok,
+                    concurrency: c,
+                    warmup: 0,
+                    max_retries: task.retries,
+                };
+
+                let result = run_benchmark(Arc::clone(&client), msgs, bench_cfg, None).await;
+
+                if !quiet {
+                    println!(
+                        "    {:.1}s  TPS={:.1}  TTFT p50={:.3}s  errors={}",
+                        result.total_duration,
+                        result.output_tps,
+                        result.ttft_p50,
+                        result.num_errors,
+                    );
+                }
+
+                cells.push(MatrixCell {
+                    input_tokens: input_tok,
+                    output_tokens: output_tok,
+                    concurrency: c,
+                    result,
+                });
+            }
+        }
+    }
+
+    let total_duration = suite_start.elapsed().as_secs_f64();
+
+    Ok(MatrixReport {
+        task_name: task.name.clone(),
+        base_url: task.base_url.clone(),
+        model: task.model.clone(),
+        n_per_cell: cfg.n_per_cell,
+        timestamp_secs,
+        total_duration,
+        cells,
+    })
+}
+
+pub fn format_matrix_markdown(report: &MatrixReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let _ = writeln!(out, "# yabench performance matrix");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| | |");
+    let _ = writeln!(out, "|---|---|");
+    let _ = writeln!(out, "| **Task** | `{}` |", report.task_name);
+    let _ = writeln!(out, "| **Endpoint** | `{}` |", report.base_url);
+    let _ = writeln!(
+        out,
+        "| **Model** | `{}` |",
+        report.model.as_deref().unwrap_or("(default)")
+    );
+    let _ = writeln!(out, "| **Requests per cell** | {} |", report.n_per_cell);
+    let _ = writeln!(
+        out,
+        "| **Generated** | {} |",
+        format_human_timestamp(report.timestamp_secs)
+    );
+    let _ = writeln!(
+        out,
+        "| **Total duration** | {} |",
+        format_duration(report.total_duration)
+    );
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Results");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "| Input | Output | c | Output TPS | Req/s | TTFT p50 | TTFT p99 | E2E p50 | E2E p99 | Prefill TPS | Errors |"
+    );
+    let _ = writeln!(
+        out,
+        "|------:|-------:|--:|-----------:|------:|---------:|---------:|--------:|--------:|------------:|-------:|"
+    );
+
+    for cell in &report.cells {
+        let r = &cell.result;
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {:.1} | {:.2} | {:.3} | {:.3} | {:.2} | {:.2} | {:.0} | {} |",
+            format_token_count(cell.input_tokens),
+            format_token_count(cell.output_tokens as usize),
+            cell.concurrency,
+            r.output_tps,
+            r.requests_per_second,
+            r.ttft_p50,
+            r.ttft_p99,
+            r.e2e_p50,
+            r.e2e_p99,
+            r.prefill_tps_mean,
+            r.num_errors,
+        );
+    }
 
     out
 }

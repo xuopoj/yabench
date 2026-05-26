@@ -29,6 +29,8 @@ Common runtime invocations once built:
 ./target/release/yabench <task> --perf-report              # concurrency sweep + markdown report
 ./target/release/yabench <task> --prefix-tokens 2000       # exercise prefix caching
 ./target/release/yabench <task> --multi-turn --dataset sharegpt-small   # realistic chat replay
+./target/release/yabench <task> --perf-matrix              # input×output×concurrency matrix
+./target/release/yabench <task> --perf-matrix --matrix-n 20  # 20 requests per cell
 ```
 
 ## Architecture
@@ -76,7 +78,7 @@ yabench.yaml ──┘                  │
 | `datasets.rs` | Embedded datasets (`include_bytes!`) + remote (HF Hub) + local-file loaders. `parse_item` understands many JSONL schemas. `load_multi_turn` expands ShareGPT/OpenAI-format conversations into round-robin growing-prefix request lists. |
 | `config.rs` | YAML config with `defaults` / `auth` / `tasks` sections. `${ENV_VAR}` interpolation; per-task merge of defaults. `parse_size` / `parse_size_u32` accept `4K`/`1M` suffixes — used by both serde and clap. |
 | `iam.rs` | One function: fetches a Huawei Cloud `X-Subject-Token` via `/v3/auth/tokens`. |
-| `perf.rs` | `--perf-report` suite: c=1,2,4,8 sweep; between levels runs an **eviction storm** then a cool-down. Detects the saturation knee. Emits Markdown. |
+| `perf.rs` | `--perf-report` suite: c=1,2,4,8 sweep; between levels runs an **eviction storm** then a cool-down. Detects the saturation knee. Emits Markdown. Also `--perf-matrix`: 3D sweep over input_tokens × output_tokens × concurrency (default grid: input [1K,4K,16K,64K,128K] × output [256,1K,4K,16K,64K] × c [1,4,8] = 75 cells). |
 
 ### Key cross-file invariants
 
