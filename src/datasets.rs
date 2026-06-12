@@ -15,6 +15,10 @@ pub const EMBEDDED_DATASETS: &[(&str, &[u8])] = &[
     ("sample-zh", include_bytes!("../datasets/sample-zh.jsonl")),
     ("alpaca-en", include_bytes!("../datasets/alpaca-en-500.jsonl")),
     ("alpaca-zh", include_bytes!("../datasets/alpaca-zh-500.jsonl")),
+    // 200 ShareGPT conversations (ShareGPT `conversations` format), sampled
+    // across the length distribution. Embedded so the default padding /
+    // multi-turn workload needs no network download.
+    ("sharegpt-mini", include_bytes!("../datasets/sharegpt-mini.jsonl")),
 ];
 
 const LOCAL_DATASETS: &[(&str, &str)] = &[
@@ -22,6 +26,7 @@ const LOCAL_DATASETS: &[(&str, &str)] = &[
     ("sample-zh", "sample-zh.jsonl"),
     ("alpaca-en", "alpaca-en-500.jsonl"),
     ("alpaca-zh", "alpaca-zh-500.jsonl"),
+    ("sharegpt-mini", "sharegpt-mini.jsonl"),
 ];
 
 pub const REMOTE_DATASETS: &[(&str, &str)] = &[

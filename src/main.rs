@@ -21,9 +21,10 @@ use datasets::{
     load_multi_turn, pad_to_target_chars,
 };
 
-/// Default corpus used when no dataset is configured — small ShareGPT-GPT4
-/// subset, real conversations, downloads on first use.
-const DEFAULT_CORPUS: &str = "sharegpt-small";
+/// Default corpus used when no dataset is configured — 200 real ShareGPT
+/// conversations embedded in the binary (no download). Use `sharegpt-small`
+/// or `sharegpt` for the larger remote sets.
+const DEFAULT_CORPUS: &str = "sharegpt-mini";
 
 #[derive(Parser, Debug)]
 #[command(
