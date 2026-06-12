@@ -20,6 +20,7 @@ pub struct BenchmarkResult {
     pub ttft_p95: f64,
     pub ttft_p98: f64,
     pub ttft_p99: f64,
+    pub ttft_max: f64,
 
     // E2E latency stats
     pub e2e_mean: f64,
@@ -28,6 +29,9 @@ pub struct BenchmarkResult {
     pub e2e_p99: f64,
 
     pub inter_token_latency_mean: f64,
+    /// Time per output token, excluding the first token: (E2E − TTFT)/(out−1),
+    /// averaged over requests. Matches vLLM bench / ais_bench "TPOT".
+    pub tpot_mean: f64,
 
     // Throughput
     pub output_tps: f64,
@@ -58,11 +62,13 @@ impl BenchmarkResult {
             ttft_p95: 0.0,
             ttft_p98: 0.0,
             ttft_p99: 0.0,
+            ttft_max: 0.0,
             e2e_mean: 0.0,
             e2e_p50: 0.0,
             e2e_p95: 0.0,
             e2e_p99: 0.0,
             inter_token_latency_mean: 0.0,
+            tpot_mean: 0.0,
             output_tps: 0.0,
             requests_per_second: 0.0,
             prefill_tps_mean: 0.0,
@@ -115,6 +121,7 @@ fn compute_stats(result: &mut BenchmarkResult) {
         result.ttft_p95 = percentile(&ttfts, 95.0);
         result.ttft_p98 = percentile(&ttfts, 98.0);
         result.ttft_p99 = percentile(&ttfts, 99.0);
+        result.ttft_max = ttfts.iter().copied().fold(0.0_f64, f64::max);
     }
 
     let e2e: Vec<f64> = completed.iter().map(|m| m.total_time).collect();
@@ -128,6 +135,21 @@ fn compute_stats(result: &mut BenchmarkResult) {
         .flat_map(|m| m.inter_token_latencies.iter().copied())
         .collect();
     result.inter_token_latency_mean = mean(&all_itl);
+
+    // TPOT: decode time per output token excluding the first, per request.
+    // Needs TTFT and at least 2 output tokens to be meaningful.
+    let tpots: Vec<f64> = completed
+        .iter()
+        .filter_map(|m| {
+            let ttft = m.ttft?;
+            if m.output_tokens >= 2 && m.total_time > ttft {
+                Some((m.total_time - ttft) / (m.output_tokens - 1) as f64)
+            } else {
+                None
+            }
+        })
+        .collect();
+    result.tpot_mean = mean(&tpots);
 
     result.total_input_tokens = completed.iter().map(|m| m.input_tokens).sum();
     result.total_output_tokens = completed.iter().map(|m| m.output_tokens).sum();
@@ -153,6 +175,10 @@ pub struct BenchmarkConfig {
     pub concurrency: usize,
     pub warmup: usize,
     pub max_retries: u32,
+    /// Steady-state arrival rate (req/s). None = burst up to `concurrency`.
+    /// Some(r) = launch one request every 1/r seconds (concurrency still caps
+    /// in-flight requests). Matches vLLM bench / ais_bench arrival model.
+    pub request_rate: Option<f64>,
 }
 
 pub async fn run_benchmark(
@@ -166,6 +192,12 @@ pub async fn run_benchmark(
     let model = config.model.map(Arc::new);
     let max_tokens = config.max_tokens;
     let max_retries = config.max_retries;
+    // Fixed inter-arrival interval when a request rate is set. Filtered to a
+    // positive, finite rate; otherwise None = burst arrival.
+    let arrival_interval = config
+        .request_rate
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .map(|r| std::time::Duration::from_secs_f64(1.0 / r));
 
     // Warm-up phase
     if config.warmup > 0 {
@@ -203,7 +235,17 @@ pub async fn run_benchmark(
 
     let mut tasks = vec![];
 
-    for msgs in messages_list.iter().cloned() {
+    for (i, msgs) in messages_list.iter().cloned().enumerate() {
+        // Pace arrivals at a fixed interval when a rate is configured. The
+        // semaphore still caps concurrent in-flight requests; pacing only
+        // controls *when* each request is launched, turning the synchronized
+        // burst into steady-state arrival (matching vLLM bench / ais_bench).
+        if i > 0 {
+            if let Some(interval) = arrival_interval {
+                tokio::time::sleep(interval).await;
+            }
+        }
+
         let client = Arc::clone(&client);
         let sem = Arc::clone(&semaphore);
         let model = model.clone();

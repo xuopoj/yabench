@@ -164,8 +164,10 @@ pub struct OpenAIClient {
     base_url: String,
     token: Option<String>,
     api_key: Option<String>,
-    timeout_secs: f64,
-    verify_ssl: bool,
+    /// Built once and reused so the connection pool keeps TCP/TLS connections
+    /// alive between requests. Rebuilding per request would force a fresh
+    /// handshake every time and count it inside TTFT.
+    client: Client,
     pub debug: bool,
     /// Shared system-role prefix prepended to every request. Used to exercise
     /// server-side prefix caching.
@@ -175,6 +177,10 @@ pub struct OpenAIClient {
     /// English-BPE default; populate via `calibrate_tokenizer` for accuracy on
     /// Chinese or other non-Latin scripts.
     pub chars_per_token: f64,
+    /// When true, sends `ignore_eos: true` so the server generates exactly
+    /// `max_tokens` instead of stopping early at an EOS token. Matches vLLM
+    /// bench `--ignore-eos` for comparable output-throughput numbers.
+    pub ignore_eos: bool,
 }
 
 impl OpenAIClient {
@@ -185,15 +191,22 @@ impl OpenAIClient {
         timeout_secs: f64,
         verify_ssl: bool,
     ) -> Result<Self> {
+        let mut builder = Client::builder()
+            .timeout(std::time::Duration::from_secs_f64(timeout_secs));
+        if !verify_ssl {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let client = builder.build()?;
+
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
             api_key,
-            timeout_secs,
-            verify_ssl,
+            client,
             debug: false,
             system_prefix: None,
             chars_per_token: 4.0,
+            ignore_eos: false,
         })
     }
 
@@ -206,7 +219,7 @@ impl OpenAIClient {
         sample: &str,
         model: Option<&str>,
     ) -> Result<f64> {
-        let client = self.build_client()?;
+        let client = &self.client;
         let mut payload = serde_json::json!({
             "messages": [{"role": "user", "content": sample}],
             "max_tokens": 1,
@@ -263,17 +276,6 @@ impl OpenAIClient {
         }
 
         Ok(ratio)
-    }
-
-    fn build_client(&self) -> Result<Client> {
-        let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs_f64(self.timeout_secs));
-
-        if !self.verify_ssl {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
-        Ok(builder.build()?)
     }
 
     /// Stream a single chat request, printing tokens to stdout as they arrive.
@@ -341,7 +343,7 @@ impl OpenAIClient {
         start: Instant,
         mut on_content: impl FnMut(&str),
     ) -> Result<()> {
-        let client = self.build_client()?;
+        let client = &self.client;
 
         // If a system_prefix is configured, prepend it as a system message.
         // (Caller-supplied messages are otherwise sent verbatim.)
@@ -362,6 +364,10 @@ impl OpenAIClient {
             "stream": true,
             "stream_options": {"include_usage": true},
         });
+
+        if self.ignore_eos {
+            payload["ignore_eos"] = Value::Bool(true);
+        }
 
         if let Some(m) = model {
             payload["model"] = Value::String(m.to_string());

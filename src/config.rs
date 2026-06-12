@@ -108,6 +108,11 @@ pub struct TaskConfig {
     pub seed: u64,
     pub warmup: usize,
     pub retries: u32,
+    /// Steady-state arrival rate (req/s). None = burst (release up to
+    /// `concurrency` at once). Some(r) = pace launches every 1/r seconds.
+    pub request_rate: Option<f64>,
+    /// Send `ignore_eos: true` so the server generates exactly `max_tokens`.
+    pub ignore_eos: bool,
 }
 
 impl Default for TaskConfig {
@@ -134,6 +139,8 @@ impl Default for TaskConfig {
             seed: 42,
             warmup: 0,
             retries: 0,
+            request_rate: None,
+            ignore_eos: false,
         }
     }
 }

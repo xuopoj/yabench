@@ -211,6 +211,7 @@ pub async fn run_perf_suite(
             concurrency: c,
             warmup: suite.warmup,
             max_retries: task.retries,
+            request_rate: task.request_rate,
         };
 
         let result = run_benchmark(Arc::clone(&client), messages_slice, bench_cfg, pb).await;
@@ -562,6 +563,7 @@ pub async fn run_perf_matrix(
                     concurrency: c,
                     warmup: 0,
                     max_retries: task.retries,
+                    request_rate: task.request_rate,
                 };
 
                 let result = run_benchmark(Arc::clone(&client), msgs, bench_cfg, None).await;

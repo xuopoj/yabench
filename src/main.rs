@@ -75,6 +75,18 @@ struct Cli {
     #[arg(long, value_parser = parse_size_u32)]
     max_tokens: Option<u32>,
 
+    /// Steady-state request rate (requests/sec). Paces request launch at a
+    /// fixed interval instead of firing a synchronized burst up to --concurrency.
+    /// Matches vLLM bench / ais_bench arrival model. Unset = burst (legacy).
+    #[arg(long, value_name = "REQ_PER_SEC")]
+    request_rate: Option<f64>,
+
+    /// Send ignore_eos so the server generates exactly --max-tokens instead of
+    /// stopping early at EOS. Matches vLLM bench --ignore-eos for comparable
+    /// output throughput.
+    #[arg(long)]
+    ignore_eos: bool,
+
     /// Approximate input tokens per prompt (accepts 4K, 32K, 128K, 1M notation)
     #[arg(long, value_parser = parse_size)]
     input_tokens: Option<usize>,
@@ -328,9 +340,10 @@ async fn calibrate_with_fallback(
     model: Option<&str>,
     quiet: bool,
 ) -> f64 {
-    // Cap probe length — a few hundred chars is plenty for a stable ratio and
-    // keeps the probe cheap on slow servers.
-    let probe: String = sample.chars().take(500).collect();
+    // Cap probe length. A larger sample gives a ratio representative of long
+    // padded prompts (and averages out per-request chat-template overhead);
+    // 3000 chars is still cheap to send.
+    let probe: String = sample.chars().take(3000).collect();
     if probe.trim().is_empty() {
         if !quiet {
             println!("  Tokenizer:   default 4.0 chars/token (no probe sample available)");
@@ -413,6 +426,8 @@ fn get_task_config(cli: &Cli) -> Result<(TaskConfig, Option<config::Config>)> {
         task.seed = cli.seed;
         if cli.warmup > 0 { task.warmup = cli.warmup; }
         if cli.retries > 0 { task.retries = cli.retries; }
+        if cli.request_rate.is_some() { task.request_rate = cli.request_rate; }
+        if cli.ignore_eos { task.ignore_eos = true; }
 
         return Ok((task, Some(cfg)));
     }
@@ -442,6 +457,8 @@ fn get_task_config(cli: &Cli) -> Result<(TaskConfig, Option<config::Config>)> {
         seed: cli.seed,
         warmup: cli.warmup,
         retries: cli.retries,
+        request_rate: cli.request_rate,
+        ignore_eos: cli.ignore_eos,
     }, None))
 }
 
@@ -477,7 +494,7 @@ fn print_summary(result: &BenchmarkResult, task: &TaskConfig) {
 
     println!("{}", bold.apply_to("Latency (seconds):"));
     println!(
-        "  TTFT    mean={:.3}  p50={:.3}  p75={:.3}  p90={:.3}  p95={:.3}  p98={:.3}  p99={:.3}",
+        "  TTFT    mean={:.3}  p50={:.3}  p75={:.3}  p90={:.3}  p95={:.3}  p98={:.3}  p99={:.3}  max={:.3}",
         result.ttft_mean,
         result.ttft_p50,
         result.ttft_p75,
@@ -485,12 +502,14 @@ fn print_summary(result: &BenchmarkResult, task: &TaskConfig) {
         result.ttft_p95,
         result.ttft_p98,
         result.ttft_p99,
+        result.ttft_max,
     );
     println!(
         "  E2E     mean={:.3}  p50={:.3}  p95={:.3}  p99={:.3}",
         result.e2e_mean, result.e2e_p50, result.e2e_p95, result.e2e_p99,
     );
     println!("  ITL     mean={:.4}", result.inter_token_latency_mean);
+    println!("  TPOT    mean={:.4}", result.tpot_mean);
     println!();
 
     println!("{}", bold.apply_to("Tokens:"));
@@ -567,6 +586,7 @@ fn result_to_json(result: &BenchmarkResult) -> serde_json::Value {
                 "p99": result.e2e_p99,
             },
             "inter_token_mean": result.inter_token_latency_mean,
+            "tpot_mean": result.tpot_mean,
         },
         "tokens": {
             "input": result.total_input_tokens,
@@ -594,7 +614,7 @@ fn write_csv(path: &PathBuf, result: &BenchmarkResult, task: &TaskConfig) -> Res
         "total_duration", "requests_per_second", "output_tps", "prefill_tps",
         "ttft_mean", "ttft_p50", "ttft_p75", "ttft_p90", "ttft_p95", "ttft_p98", "ttft_p99",
         "e2e_mean", "e2e_p50", "e2e_p95", "e2e_p99",
-        "inter_token_latency_mean",
+        "inter_token_latency_mean", "tpot_mean",
         "total_input_tokens", "total_output_tokens",
         "input_tokens_estimated", "output_tokens_estimated",
     ];
@@ -605,7 +625,7 @@ fn write_csv(path: &PathBuf, result: &BenchmarkResult, task: &TaskConfig) -> Res
 
     writeln!(
         writer,
-        "{},{},{},{},{},{},{:.6},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{}",
+        "{},{},{},{},{},{},{:.6},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{}",
         task.name,
         task.dataset.as_deref().unwrap_or(""),
         task.concurrency,
@@ -628,6 +648,7 @@ fn write_csv(path: &PathBuf, result: &BenchmarkResult, task: &TaskConfig) -> Res
         result.e2e_p95,
         result.e2e_p99,
         result.inter_token_latency_mean,
+        result.tpot_mean,
         result.total_input_tokens,
         result.total_output_tokens,
         result.input_tokens_estimated_count,
@@ -655,6 +676,7 @@ async fn run_task(
     )?;
     client.debug = debug;
     client.system_prefix = prefix.clone();
+    client.ignore_eos = task.ignore_eos;
 
     if !quiet {
         println!("yabench — Running task: {}", task.name);
@@ -664,7 +686,15 @@ async fn run_task(
             "  Requests:    {} (concurrency: {})",
             task.num_requests, task.concurrency
         );
-        println!("  Max tokens:  {}", task.max_tokens);
+        match task.request_rate {
+            Some(r) => println!("  Arrival:     {r} req/s (steady-state pacing)"),
+            None => println!("  Arrival:     burst (up to concurrency at once)"),
+        }
+        println!(
+            "  Max tokens:  {}{}",
+            task.max_tokens,
+            if task.ignore_eos { " (ignore_eos: exact length)" } else { "" }
+        );
         if let Some(ds) = &task.dataset {
             println!("  Dataset:     {ds}");
         }
@@ -680,13 +710,21 @@ async fn run_task(
 
     let source = resolve_source(task, multi_turn, max_turns, task.num_requests, quiet).await?;
 
+    // For padded prompts, calibrate against a sample built the same way the
+    // real prompts are (many corpus entries concatenated), not a single short
+    // entry — short isolated snippets tokenize denser than long flowing text,
+    // which made the ratio overestimate chars/token and undershoot the target.
     let calibration_sample: String = match &source {
         Source::Ready(msgs) => first_user_content(msgs)
             .unwrap_or_else(|| SYSTEM_PREFIX_TEMPLATE.to_string()),
-        Source::Pad { corpus, .. } => corpus
-            .first()
-            .cloned()
-            .unwrap_or_else(|| SYSTEM_PREFIX_TEMPLATE.to_string()),
+        Source::Pad { corpus, .. } => {
+            let joined: String = corpus.join("\n\n---\n\n");
+            if joined.trim().is_empty() {
+                SYSTEM_PREFIX_TEMPLATE.to_string()
+            } else {
+                joined
+            }
+        }
     };
     let ratio =
         calibrate_with_fallback(&client, &calibration_sample, task.model.as_deref(), quiet).await;
@@ -718,6 +756,7 @@ async fn run_task(
         concurrency: task.concurrency,
         warmup: task.warmup,
         max_retries: task.retries,
+        request_rate: task.request_rate,
     };
 
     let result = run_benchmark(client, messages_list, bench_config, pb).await;
@@ -894,6 +933,7 @@ async fn main() -> Result<()> {
         )?;
         client.debug = cli.debug;
         client.system_prefix = prefix.clone();
+        client.ignore_eos = task.ignore_eos;
 
         let source = resolve_source(
             &task,
@@ -973,6 +1013,7 @@ async fn main() -> Result<()> {
         )?;
         client.debug = cli.debug;
         client.system_prefix = prefix.clone();
+        client.ignore_eos = task.ignore_eos;
 
         let mut matrix_cfg = perf::MatrixConfig {
             n_per_cell: cli.matrix_n,

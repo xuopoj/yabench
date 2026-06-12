@@ -36,6 +36,20 @@ defaults:
   # exact token count per request. Omit entirely to keep the default.
   timeout: 120
   no_verify_ssl: true
+  # warmup: number of warm-up requests sent before measurement (discarded from
+  #   metrics). IMPORTANT for fair TTFT: the first request to a fresh server
+  #   pays one-time cold-start cost (kernel/JIT/spec-decode warmup) that
+  #   otherwise inflates the TTFT mean. ais_bench defaults to 1 warmup; set
+  #   `warmup: 1` to match it. This — not request_rate — is what aligns yabench
+  #   with ais_bench (a closed-loop, no-pacing benchmark).
+  # request_rate: steady-state arrival pacing (requests/sec). Omitted = burst /
+  #   closed-loop (release up to `concurrency`, refill as they drain — this is
+  #   what ais_bench does). Set a rate to match vLLM bench's `--request-rate`
+  #   (paced Poisson-ish arrival) instead. NOTE: request_rate does NOT replicate
+  #   ais_bench; for ais_bench use burst + warmup:1.
+  # ignore_eos: when true, sends `ignore_eos: true` so the server generates
+  #   exactly `max_tokens` instead of stopping early at EOS. Matches vLLM
+  #   bench `--ignore-eos`; needed for comparable output-throughput / E2E.
 
 # Benchmark tasks
 tasks:
@@ -56,6 +70,33 @@ tasks:
     base_url: http://localhost:8000/v1
     dataset: /path/to/prompts.jsonl
     shuffle: true
+
+  # Aligning with ais_bench (closed-loop, concurrency-8, 1 warmup): fixed
+  # 1K-in/256-out, burst arrival, 1 warmup, exact-length generation. Validated:
+  # yabench's TTFT/ITL/TPOT land on ais_bench's within noise. `warmup: 1` is the
+  # key knob — it absorbs first-request cold-start that otherwise inflates TTFT.
+  align-test:
+    base_url: http://localhost:8000/v1
+    model: my-model
+    input_tokens: 1K
+    max_tokens: 256
+    concurrency: 8
+    num_requests: 50
+    warmup: 1
+    ignore_eos: true
+
+  # Aligning with `vllm bench serve --request-rate R`: same as above but PACED
+  # (steady-state arrival) instead of closed-loop. Set request_rate to vLLM's R.
+  align-test-paced:
+    base_url: http://localhost:8000/v1
+    model: my-model
+    input_tokens: 1K
+    max_tokens: 256
+    concurrency: 8
+    num_requests: 50
+    warmup: 1
+    request_rate: 1.85
+    ignore_eos: true
 
   # Long-context test: each request is padded to ~128K tokens of real
   # ShareGPT content. Concurrency=1 because long prefill dominates wall time.
